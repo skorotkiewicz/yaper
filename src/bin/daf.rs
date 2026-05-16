@@ -34,25 +34,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Input config:  {:?}", input_config);
     println!("Output config: {:?}", output_config);
 
-    // Extract needed values before the move
-    let sample_rate = input_config.sample_rate().0;
-    let channels = input_config.channels();
-    let channels_usize = channels as usize;
-    let delay_samples = (args.delay / 1000.0 * sample_rate as f32 * channels_usize as f32) as usize;
+    let sample_rate = output_config.sample_rate().0 as f32;
+    let channels = output_config.channels() as usize;
+    let input_channels = input_config.channels() as usize;
 
-    // Buffer sized for delay + extra
-    let ring = HeapRb::new(delay_samples + sample_rate as usize / 10);
+    // FIX 1: Don't multiply by channels — think in mono frames
+    let delay_samples = (args.delay / 1000.0 * sample_rate) as usize;
+
+    let ring = HeapRb::new(delay_samples * 2);
     let (mut producer, mut consumer) = ring.split();
+
+    // FIX 2: Pre-fill with silence so output reads zeros first,
+    // creating the actual delay
+    for _ in 0..delay_samples {
+        let _ = producer.push(0.0);
+    }
 
     let err_fn = |err| eprintln!("stream error: {}", err);
 
-    // Input stream
     let input_stream = match input_config.sample_format() {
         cpal::SampleFormat::F32 => input_device.build_input_stream(
             &input_config.into(),
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                for &sample in data {
-                    let _ = producer.push(sample);
+                // FIX 1: Push only one sample per frame (mono downmix)
+                for frame in data.chunks(input_channels) {
+                    let mono: f32 = frame.iter().sum::<f32>() / input_channels as f32;
+                    let _ = producer.push(mono);
                 }
             },
             err_fn,
@@ -63,16 +70,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // Output stream - use same sample rate as input
     let output_stream = match output_config.sample_format() {
         cpal::SampleFormat::F32 => output_device.build_output_stream(
-            &cpal::StreamConfig {
-                channels,
-                sample_rate: cpal::SampleRate(sample_rate),
-                buffer_size: cpal::BufferSize::Default,
-            },
+            &output_config.into(),
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                for frame in data.chunks_mut(channels_usize) {
+                for frame in data.chunks_mut(channels) {
                     let sample = consumer.pop().unwrap_or(0.0);
                     for ch in frame.iter_mut() {
                         *ch = sample;
