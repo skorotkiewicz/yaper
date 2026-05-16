@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 cpal = "0.15"
 clap = { version = "4", features = ["derive"] }
+ringbuf = "0.3"

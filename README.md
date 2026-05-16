@@ -2,26 +2,9 @@
 
 Minimal audio threshold detector and tone-pulse generator.
 
-## What it does
+## Binaries
 
-- **Listens** to your default microphone.
-- **Detects** when input exceeds a configurable amplitude threshold.
-- **Plays** a short tone pulse on your default output.
-- **Waits** a configurable cooldown, then listens again.
-
-## Install / Build
-
-```bash
-cargo build --release
-```
-
-Binary ends up in `target/release/yaper`.
-
-## Usage
-
-```bash
-yaper [OPTIONS]
-```
+### yaper (threshold detector)
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -30,18 +13,36 @@ yaper [OPTIONS]
 | `-d, --pulse-duration` | `100` | Pulse length in milliseconds |
 | `-c, --cooldown` | `5` | Wait time after pulse in milliseconds |
 
-### Examples
+### daf (Delayed Auditory Feedback)
 
-Run with defaults:
+Applies a configurable delay to microphone input, useful for speech therapy.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-t, --threshold` | `0.05` | Input amplitude threshold (0.0–1.0) |
+| `-r, --release` | `100` | Release time in ms after signal drops |
+| `-d, --delay` | `200` | Delay time in milliseconds |
+
+## Install / Build
 
 ```bash
-yaper
+cargo build --release
 ```
 
-Stricter threshold, 1500 Hz tone, longer pulse:
+Binaries end up in `target/release/`.
+
+## Usage
+
+### yaper
 
 ```bash
-yaper --threshold 0.85 --frequency 1500 --pulse-duration 200
+yaper [OPTIONS]
+```
+
+### daf
+
+```bash
+daf --delay 200
 ```
 
 ## Requirements

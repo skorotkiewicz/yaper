@@ -8,6 +8,14 @@ use std::time::Duration;
 #[command(name = "daf")]
 #[command(about = "Delayed Auditory Feedback")]
 struct Args {
+    /// Input amplitude threshold, linear 0.0–1.0 (default 0.05)
+    #[arg(short, long, default_value_t = 0.05)]
+    threshold: f32,
+
+    /// Release time in ms — how long the gate stays open after signal drops (default 100)
+    #[arg(short, long, default_value_t = 100.0)]
+    release: f32,
+
     /// Delay time in milliseconds (default 200)
     #[arg(short, long, default_value_t = 200.0)]
     delay: f32,
@@ -15,6 +23,8 @@ struct Args {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+
+    let threshold = args.threshold;
 
     let host = cpal::default_host();
 
@@ -38,28 +48,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let channels = output_config.channels() as usize;
     let input_channels = input_config.channels() as usize;
 
-    // FIX 1: Don't multiply by channels — think in mono frames
     let delay_samples = (args.delay / 1000.0 * sample_rate) as usize;
+    let release_frames = (args.release / 1000.0 * sample_rate) as usize;
 
     let ring = HeapRb::new(delay_samples * 2);
     let (mut producer, mut consumer) = ring.split();
 
-    // FIX 2: Pre-fill with silence so output reads zeros first,
-    // creating the actual delay
+    // Pre-fill with silence to create the initial delay
     for _ in 0..delay_samples {
         let _ = producer.push(0.0);
     }
 
     let err_fn = |err| eprintln!("stream error: {}", err);
 
+    // Gate state: how many frames to keep the gate open after signal drops
+    let mut gate_hold: usize = 0;
+
     let input_stream = match input_config.sample_format() {
         cpal::SampleFormat::F32 => input_device.build_input_stream(
             &input_config.into(),
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                // FIX 1: Push only one sample per frame (mono downmix)
+                // Peak across entire buffer (avoids cutting word starts)
+                let peak = data.iter().fold(0.0f32, |acc, s| acc.max(s.abs()));
+
+                // Open / refresh the gate while signal is loud
+                if peak > threshold {
+                    gate_hold = release_frames;
+                }
+
+                // Always push one sample per frame — real audio or zeros
                 for frame in data.chunks(input_channels) {
                     let mono: f32 = frame.iter().sum::<f32>() / input_channels as f32;
-                    let _ = producer.push(mono);
+                    if gate_hold > 0 {
+                        let _ = producer.push(mono);
+                        gate_hold = gate_hold.saturating_sub(1);
+                    } else {
+                        let _ = producer.push(0.0);
+                    }
                 }
             },
             err_fn,
@@ -92,7 +117,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     input_stream.play()?;
     output_stream.play()?;
 
-    println!("DAF running — delay {:.0} ms", args.delay);
+    println!(
+        "DAF running — delay {:.0} ms, threshold {:.4}",
+        args.delay, threshold
+    );
     println!("Press Ctrl+C to stop.");
 
     loop {
