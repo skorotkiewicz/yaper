@@ -8,14 +8,14 @@ use std::time::Duration;
 
 #[derive(Parser, Debug)]
 #[command(name = "radio")]
-#[command(about = "Generative Synthwave / Ambient Radio")]
+#[command(about = "Generative Synthwave / Ambient Radio", version = "0.1.0-2")]
 struct Args {
     /// Master volume 0.0–1.0 (default 0.5)
-    #[arg(short, long, default_value_t = 0.5)]
+    #[arg(short, default_value_t = 0.5)]
     volume: f32,
 
     /// Station change interval in seconds (default 15)
-    #[arg(short, long, default_value_t = 15)]
+    #[arg(short, default_value_t = 15)]
     interval: u64,
 }
 
