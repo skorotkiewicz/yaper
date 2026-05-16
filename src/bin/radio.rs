@@ -8,7 +8,7 @@ use std::time::Duration;
 
 #[derive(Parser, Debug)]
 #[command(name = "radio")]
-#[command(about = "Generative Synthwave / Ambient Radio", version = "0.1.0-2")]
+#[command(about = "Generative Synthwave / Ambient Radio", version = "0.2.0")]
 struct Args {
     /// Master volume 0.0–1.0 (default 0.5)
     #[arg(short, default_value_t = 0.5)]
@@ -58,12 +58,12 @@ impl Voice {
         }
     }
     fn play(&mut self, sr: f32) -> f32 {
-        if self.amp < 0.001 {
+        if self.amp < 0.0005 {
             return 0.0;
         }
         self.phase += self.freq / sr;
-        self.phase %= 1.0; // self.phase = self.phase % 1.0;
-        let out = match self.wave {
+        self.phase %= 1.0;
+        let raw = match self.wave {
             1 => {
                 if self.phase < 0.5 {
                     1.0
@@ -74,9 +74,9 @@ impl Voice {
             2 => 2.0 * self.phase - 1.0,
             _ => (self.phase * TAU).sin(),
         };
-        let val = out * self.amp;
+        let out = raw * self.amp;
         self.amp *= self.decay;
-        val
+        out
     }
     fn trigger(&mut self, freq: f32, amp: f32, decay: f32, wave: u8) {
         self.phase = 0.0;
@@ -87,6 +87,7 @@ impl Voice {
     }
 }
 
+// ---------------- FM VOICE ----------------
 struct FmVoice {
     c_phase: f32,
     m_phase: f32,
@@ -110,18 +111,17 @@ impl FmVoice {
         }
     }
     fn play(&mut self, sr: f32) -> f32 {
-        if self.amp < 0.001 {
+        if self.amp < 0.0005 {
             return 0.0;
         }
         self.m_phase += self.m_freq / sr;
         self.c_phase += self.c_freq / sr;
-        self.m_phase %= 1.0; // self.m_phase = self.m_phase % 1.0;
-        self.c_phase %= 1.0; // self.c_phase = self.c_phase % 1.0;
-
-        let modulator = (self.m_phase * TAU).sin() * self.m_index;
-        let val = (self.c_phase * TAU + modulator).sin() * self.amp;
+        self.m_phase %= 1.0;
+        self.c_phase %= 1.0;
+        let modulation = (self.m_phase * TAU).sin() * self.m_index;
+        let out = (self.c_phase * TAU + modulation).sin() * self.amp;
         self.amp *= self.decay;
-        val
+        out
     }
     fn trigger(&mut self, freq: f32, ratio: f32, m_index: f32, amp: f32, decay: f32) {
         self.c_phase = 0.0;
@@ -134,6 +134,7 @@ impl FmVoice {
     }
 }
 
+// ---------------- KICK ----------------
 struct Kick {
     phase: f32,
     freq: f32,
@@ -153,12 +154,12 @@ impl Kick {
         }
     }
     fn play(&mut self, sr: f32) -> f32 {
-        if self.amp < 0.001 {
+        if self.amp < 0.0005 {
             return 0.0;
         }
         self.freq += (self.target - self.freq) * 0.1; // Pitch drop
         self.phase += self.freq / sr;
-        self.phase %= 1.0; // self.phase = self.phase % 1.0;
+        self.phase %= 1.0;
         let val = (self.phase * TAU).sin() * self.amp;
         self.amp *= self.decay;
         val
@@ -172,6 +173,7 @@ impl Kick {
     }
 }
 
+// ---------------- DRONE ----------------
 struct Drone {
     phase1: f32,
     phase2: f32,
@@ -204,8 +206,8 @@ impl Drone {
 
         self.phase1 += self.freq1 / sr;
         self.phase2 += self.freq2 / sr;
-        self.phase1 %= 1.0; // self.phase1 = self.phase1 % 1.0;
-        self.phase2 %= 1.0; // self.phase2 = self.phase2 % 1.0;
+        self.phase1 %= 1.0;
+        self.phase2 %= 1.0;
 
         ((self.phase1 * TAU).sin() + (self.phase2 * TAU).sin()) * 0.5 * self.amp
     }
@@ -215,9 +217,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     let host = cpal::default_host();
-    let output_device = host
-        .default_output_device()
-        .expect("no default output device available");
+    let output_device = host.default_output_device().expect("No output device");
 
     println!("Output: {}", output_device.name()?);
     let output_config = output_device.default_output_config()?;
@@ -246,8 +246,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bell_decay = (-1.0 / (out_sr * 3.0)).exp();
     let bass_decay = (-1.0 / (out_sr * 0.8)).exp();
     let dash_decay = (-1.0 / (out_sr * 0.5)).exp();
+    let jazz_decay = (-1.0 / (out_sr * 1.8)).exp();
+    let vinyl_decay = (-1.0 / (out_sr * 0.02)).exp();
 
-    // *** FIX: Audio engine state MUST be declared outside the closure to persist across callbacks! ***
+    // ---------------- ENGINE ----------------
     let mut rng = Lcg::new(42);
     let mut kick = Kick::new();
     let mut hat = Voice::new();
@@ -257,6 +259,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut fm1 = FmVoice::new();
     let mut fm2 = FmVoice::new();
     let mut drone = Drone::new();
+    let mut jazz_chord = Voice::new();
+    let mut jazz_bass = Voice::new();
+    let mut jazz_keys = FmVoice::new();
+    let mut vinyl = Voice::new();
 
     let mut step: usize = 0;
     let mut sample_counter: usize = 0;
@@ -283,8 +289,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                         let cur_station = station_out.load(Ordering::Relaxed);
 
+                        // -------------------------------------------------
+                        // STATION 1
+                        // Midnight Drive FM
+                        // -------------------------------------------------
                         if cur_station == 0 {
-                            // Station 1: Midnight Drive (Synthwave)
                             drone.target_amp = 0.0;
                             if step == 0 || step == 8 {
                                 kick.trigger(150.0, 50.0, 0.8, kick_decay);
@@ -304,8 +313,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let idx = (rng.next() % bass_notes.len() as u32) as usize;
                                 bass.trigger(bass_notes[idx], 0.4, bass_decay, 1);
                             }
-                        } else if cur_station == 1 {
-                            // Station 2: Cosmic Lullaby (Ambient FM)
+                        }
+                        // -------------------------------------------------
+                        // STATION 2
+                        // Cosmic Lullaby
+                        // -------------------------------------------------
+                        else if cur_station == 1 {
                             drone.target_amp = 0.3;
                             if step == 0 {
                                 let idx = (rng.next() % bass_notes.len() as u32) as usize;
@@ -320,8 +333,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let idx = (rng.next() % penta.len() as u32) as usize;
                                 fm2.trigger(penta[idx] * 0.5, 2.0, 0.8, 0.3, bell_decay);
                             }
-                        } else if cur_station == 2 {
-                            // Station 3: The Bunker (Numbers Station)
+                        }
+                        // -------------------------------------------------
+                        // STATION 3
+                        // Numbers Station
+                        // -------------------------------------------------
+                        else if cur_station == 2 {
                             drone.target_amp = 0.4;
                             drone.target_freq1 = 55.0;
                             drone.target_freq2 = 55.2;
@@ -334,6 +351,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             if step == 6 {
                                 bass.trigger(800.0, 0.5, dash_decay, 0);
+                            }
+                        }
+                        // -------------------------------------------------
+                        // STATION 4
+                        // Rainy Night Café
+                        // -------------------------------------------------
+                        else if cur_station == 3 {
+                            drone.target_amp = 0.18;
+                            if step == 0 {
+                                let roots = [65.41, 73.42, 87.31, 98.00];
+                                let idx = (rng.next() % roots.len() as u32) as usize;
+                                drone.target_freq1 = roots[idx];
+                                drone.target_freq2 = roots[idx] * 1.01;
+                                jazz_bass.trigger(roots[idx], 0.35, bass_decay, 0);
+                            }
+                            if step == 0 || step == 10 {
+                                kick.trigger(90.0, 42.0, 0.35, kick_decay);
+                            }
+                            if step.is_multiple_of(2) {
+                                let noise_freq = 4000.0 + rng.f32() * 2000.0;
+                                hat.trigger(noise_freq, 0.08, hat_decay, 2);
+                            }
+                            if step == 2 || step == 6 || step == 14 {
+                                let chord = [261.63, 311.13, 392.00, 466.16];
+                                let note = chord[(rng.next() % chord.len() as u32) as usize];
+                                jazz_chord.trigger(
+                                    note * (0.995 + rng.f32() * 0.01),
+                                    0.22,
+                                    jazz_decay,
+                                    0,
+                                );
+                            }
+                            if rng.f32() > 0.82 {
+                                let notes = [523.25, 587.33, 698.46, 783.99];
+                                let idx = (rng.next() % notes.len() as u32) as usize;
+                                jazz_keys.trigger(notes[idx], 2.0, 1.2, 0.18, bell_decay);
+                            }
+                            if rng.f32() > 0.985 {
+                                vinyl.trigger(1200.0 + rng.f32() * 4000.0, 0.04, vinyl_decay, 1);
                             }
                         }
                     }
@@ -389,6 +445,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Midnight Drive FM",
         "Cosmic Lullaby",
         "The Bunker - Numbers Station",
+        "Rainy Night Café",
     ];
     println!(">> Now playing: {}", names[0]);
     println!(
@@ -405,7 +462,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         retuning.store(true, Ordering::Relaxed);
         thread::sleep(Duration::from_secs(2)); // 2 seconds of static
 
-        let new_station = (main_rng.next() % 3) as usize;
+        let new_station = (main_rng.next() % names.len() as u32) as usize;
         station.store(new_station, Ordering::Relaxed);
         retuning.store(false, Ordering::Relaxed);
 
