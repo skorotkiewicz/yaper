@@ -302,7 +302,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 snare.trigger(600.0, 0.3, hat_decay, 1);
                             }
                             if step.is_multiple_of(2) {
-                                // if step % 2 == 0 {
                                 hat.trigger(800.0, 0.2, hat_decay, 2);
                             }
                             if rng.f32() > 0.6 {
@@ -392,6 +391,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 vinyl.trigger(1200.0 + rng.f32() * 4000.0, 0.04, vinyl_decay, 1);
                             }
                         }
+                        // -------------------------------------------------
+                        // STATION 5
+                        // Neon Grid Run
+                        // -------------------------------------------------
+                        else if cur_station == 4 {
+                            drone.target_amp = 0.12;
+                            // Four-on-the-floor kick
+                            if step % 4 == 0 {
+                                kick.trigger(140.0, 45.0, 0.7, kick_decay);
+                            }
+                            // Driving offbeat hats
+                            if step % 2 == 1 {
+                                hat.trigger(6000.0 + rng.f32() * 2000.0, 0.15, hat_decay, 2);
+                            }
+                            // Snare on 4 and 12
+                            if step == 4 || step == 12 {
+                                snare.trigger(300.0, 0.4, hat_decay, 1);
+                            }
+                            // Fast arpeggiator, alternating octaves mid-bar
+                            if rng.f32() > 0.3 {
+                                let idx = (rng.next() % penta.len() as u32) as usize;
+                                let octave = if step < 8 { 1.0 } else { 2.0 };
+                                arp.trigger(penta[idx] * octave, 0.25, pluck_decay, 2);
+                            }
+                            // Pulsing bass
+                            if step == 0 || step == 8 {
+                                let idx = (rng.next() % bass_notes.len() as u32) as usize;
+                                bass.trigger(bass_notes[idx], 0.5, bass_decay, 1);
+                            }
+                            // Occasional FM stabs on offbeats
+                            if step == 6 || step == 14 {
+                                fm1.trigger(
+                                    penta[(rng.next() % penta.len() as u32) as usize] * 1.5,
+                                    1.5,
+                                    2.0,
+                                    0.2,
+                                    bell_decay,
+                                );
+                            }
+                        }
                     }
 
                     // Synthesize current audio frame
@@ -446,6 +485,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Cosmic Lullaby",
         "The Bunker - Numbers Station",
         "Rainy Night Café",
+        "Neon Grid Run",
     ];
     println!(">> Now playing: {}", names[0]);
     println!(
