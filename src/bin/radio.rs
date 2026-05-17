@@ -14,6 +14,10 @@ struct Args {
     #[arg(short, default_value_t = 0.5)]
     volume: f32,
 
+    /// Starting station (default 0)
+    #[arg(short, default_value_t = 0)]
+    station: u8,
+
     /// Station change interval in seconds (default 15)
     #[arg(short, default_value_t = 15)]
     interval: u64,
@@ -226,7 +230,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out_sr = output_config.sample_rate().0 as f32;
     let channels = output_config.channels() as usize;
 
-    let station = Arc::new(AtomicUsize::new(0));
+    let station = Arc::new(AtomicUsize::new(args.station.into()));
     let retuning = Arc::new(AtomicBool::new(false));
 
     let station_out = Arc::clone(&station);
@@ -398,7 +402,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         else if cur_station == 4 {
                             drone.target_amp = 0.12;
                             // Four-on-the-floor kick
-                            if step % 4 == 0 {
+                            if step.is_multiple_of(4) {
+                                // if step % 4 == 0 {
                                 kick.trigger(140.0, 45.0, 0.7, kick_decay);
                             }
                             // Driving offbeat hats
@@ -487,7 +492,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Rainy Night Café",
         "Neon Grid Run",
     ];
-    println!(">> Now playing: {}", names[0]);
+    let start_idx = (args.station as usize).min(names.len() - 1);
+    station.store(start_idx, Ordering::Relaxed);
+    println!(">> Now playing: {}", names[start_idx]);
     println!(
         "Radio running — auto-tuning every {}s. Press Ctrl+C to stop.\n",
         args.interval
