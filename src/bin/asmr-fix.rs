@@ -261,42 +261,123 @@ impl Brush {
     }
 }
 
-struct Binaural {
-    phase_l: f32,
-    phase_r: f32,
+#[inline(always)]
+fn cubic_clip(x: f32) -> f32 {
+    if x <= -1.0 {
+        -2.0 / 3.0
+    } else if x >= 1.0 {
+        2.0 / 3.0
+    } else {
+        x - (x * x * x) / 3.0
+    }
+}
+
+struct FastBinaural {
+    // Current sample states
+    sin_l: f32,
+    cos_l: f32,
+    sin_r: f32,
+    cos_r: f32,
+
+    // Step coefficients (rotation matrix constants)
+    k_sin_l: f32,
+    k_cos_l: f32,
+    k_sin_r: f32,
+    k_cos_r: f32,
+
     freq_base: f32,
     freq_diff: f32,
     amp: f32,
     target_amp: f32,
 }
 
-impl Binaural {
-    fn new(freq_diff: f32) -> Self {
-        Self {
-            phase_l: 0.0,
-            phase_r: 0.0,
+impl FastBinaural {
+    fn new(freq_diff: f32, sr: f32) -> Self {
+        let mut s = Self {
+            sin_l: 0.0,
+            cos_l: 1.0, // Cosine starts at 1.0, Sine at 0.0
+            sin_r: 0.0,
+            cos_r: 1.0,
+            k_sin_l: 0.0,
+            k_cos_l: 0.0,
+            k_sin_r: 0.0,
+            k_cos_r: 0.0,
             freq_base: 60.0,
             freq_diff,
             amp: 0.0,
             target_amp: 0.12,
-        }
+        };
+        s.update_coefficients(sr);
+        s
     }
 
+    // Call this ONLY when freq_base or freq_diff changes (Control Rate)
+    fn update_coefficients(&mut self, sr: f32) {
+        use std::f32::consts::TAU;
+        let omega_l = (self.freq_base * TAU) / sr;
+        let omega_r = ((self.freq_base + self.freq_diff) * TAU) / sr;
+
+        self.k_sin_l = omega_l.sin();
+        self.k_cos_l = omega_l.cos();
+        self.k_sin_r = omega_r.sin();
+        self.k_cos_r = omega_r.cos();
+    }
+
+    #[inline(always)]
     fn play(&mut self, sr: f32) -> (f32, f32) {
-        let smooth_coeff = 1.0 / (sr * 3.0); // 3 seconds smoothing
+        let smooth_coeff = 1.0 / (sr * 3.0);
         self.amp += (self.target_amp - self.amp) * smooth_coeff;
 
-        self.phase_l += self.freq_base / sr;
-        self.phase_r += (self.freq_base + self.freq_diff) / sr;
-        self.phase_l %= 1.0;
-        self.phase_r %= 1.0;
+        // Vector rotation for Left channel (No transcendental math!)
+        let next_sin_l = self.sin_l * self.k_cos_l + self.cos_l * self.k_sin_l;
+        self.cos_l = self.cos_l * self.k_cos_l - self.sin_l * self.k_sin_l;
+        self.sin_l = next_sin_l;
 
-        (
-            (self.phase_l * TAU).sin() * self.amp,
-            (self.phase_r * TAU).sin() * self.amp,
-        )
+        // Vector rotation for Right channel
+        let next_sin_r = self.sin_r * self.k_cos_r + self.cos_r * self.k_sin_r;
+        self.cos_r = self.cos_r * self.k_cos_r - self.sin_r * self.k_sin_r;
+        self.sin_r = next_sin_r;
+
+        (self.sin_l * self.amp, self.sin_r * self.amp)
     }
 }
+
+// struct Binaural {
+//     phase_l: f32,
+//     phase_r: f32,
+//     freq_base: f32,
+//     freq_diff: f32,
+//     amp: f32,
+//     target_amp: f32,
+// }
+
+// impl Binaural {
+//     fn new(freq_diff: f32) -> Self {
+//         Self {
+//             phase_l: 0.0,
+//             phase_r: 0.0,
+//             freq_base: 60.0,
+//             freq_diff,
+//             amp: 0.0,
+//             target_amp: 0.12,
+//         }
+//     }
+
+//     fn play(&mut self, sr: f32) -> (f32, f32) {
+//         let smooth_coeff = 1.0 / (sr * 3.0); // 3 seconds smoothing
+//         self.amp += (self.target_amp - self.amp) * smooth_coeff;
+
+//         self.phase_l += self.freq_base / sr;
+//         self.phase_r += (self.freq_base + self.freq_diff) / sr;
+//         self.phase_l %= 1.0;
+//         self.phase_r %= 1.0;
+
+//         (
+//             (self.phase_l * TAU).sin() * self.amp,
+//             (self.phase_r * TAU).sin() * self.amp,
+//         )
+//     }
+// }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
@@ -395,7 +476,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut heartbeat = Trigger::new();
     let mut chime = Chime::new();
     let mut brush = Brush::new();
-    let mut drone = Binaural::new(binaural_freq);
+    let mut drone = FastBinaural::new(binaural_freq, out_sr);
 
     let mut sample_counter: usize = 0;
     let mut next_trigger_time: usize = (out_sr * 0.2) as usize;
@@ -560,8 +641,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 out_r += drone_r * drone_lfo;
 
                 // Soft clip & Master Volume
-                out_l = (out_l * volume).tanh();
-                out_r = (out_r * volume).tanh();
+                // out_l = (out_l * volume).tanh();
+                // out_r = (out_r * volume).tanh();
+                out_l = cubic_clip(out_l * volume);
+                out_r = cubic_clip(out_r * volume);
 
                 // Channel Assignment
                 if channels == 1 {
