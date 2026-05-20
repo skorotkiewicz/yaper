@@ -315,34 +315,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(input_device) = host.default_input_device()
         && let Ok(input_config) = input_device.default_input_config()
     {
-        let in_channels = input_config.channels() as usize;
+        // let in_channels = input_config.channels() as usize;
         let err_fn = |err: cpal::StreamError| eprintln!("Input error: {}", err);
 
-        // println!("🎤 Input: {}", input_device.name()?);
-        // println!("⚙️ Input Config: {:?}", input_config);
+        println!("🎤 Input: {}", input_device.name()?);
+        println!("⚙️ Input Config: {:?}", input_config);
 
         let input_stream = input_device.build_input_stream(
             &input_config.into(),
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                if !data.is_empty() && in_channels > 0 {
-                    let frames = data.len() / in_channels;
-                    if frames > 0 {
-                        let mut sum = 0.0f32;
-                        for frame in data.chunks(in_channels) {
-                            let sample = frame[0];
-                            sum += sample * sample;
-                        }
-                        let rms = (sum / frames as f32).sqrt();
-                        // Smooth the RMS to avoid jitter, map to u32
-                        let prev = ambient_level_in.load(Ordering::Relaxed) as f32 / 10000.0;
-                        let smoothed = prev + (rms - prev) * 0.2;
-                        ambient_level_in.store((smoothed * 10000.0) as u32, Ordering::Relaxed);
+                if !data.is_empty() {
+                    let mut sum = 0.0f32;
+
+                    for &sample in data {
+                        sum += sample * sample;
                     }
+
+                    let rms = (sum / data.len() as f32).sqrt();
+
+                    // Smooth the RMS to avoid jitter, map to u32
+                    let prev = ambient_level_in.load(Ordering::Relaxed) as f32 / 10000.0;
+                    let smoothed = prev + (rms - prev) * 0.2;
+
+                    ambient_level_in.store((smoothed * 10000.0) as u32, Ordering::Relaxed);
                 }
             },
             err_fn,
             None,
         )?;
+
+        // let input_stream = input_device.build_input_stream(
+        //     &input_config.into(),
+        //     move |data: &[f32], _: &cpal::InputCallbackInfo| {
+        //         if !data.is_empty() && in_channels > 0 {
+        //             let frames = data.len() / in_channels;
+        //             if frames > 0 {
+        //                 let mut sum = 0.0f32;
+        //                 for frame in data.chunks(in_channels) {
+        //                     let sample = frame[0];
+        //                     sum += sample * sample;
+        //                 }
+        //                 let rms = (sum / frames as f32).sqrt();
+        //                 // Smooth the RMS to avoid jitter, map to u32
+        //                 let prev = ambient_level_in.load(Ordering::Relaxed) as f32 / 10000.0;
+        //                 let smoothed = prev + (rms - prev) * 0.2;
+        //                 ambient_level_in.store((smoothed * 10000.0) as u32, Ordering::Relaxed);
+        //             }
+        //         }
+        //     },
+        //     err_fn,
+        //     None,
+        // )?;
 
         input_stream.play()?;
         std::mem::forget(input_stream); // Prevent drop, keep stream alive
@@ -383,6 +406,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let err_fn = |err: cpal::StreamError| eprintln!("Output error: {}", err);
 
+    // --- Scene Cycling for Mixed Mode ---
+    let mut mixed_scene: usize = 0; // 0: Rain, 1: Brush, 2: Tingles
+    let mut mixed_scene_counter: usize = 0;
+    let mixed_scene_duration = (out_sr * 15.0) as usize; // 15s per focus
+
     let output_stream = output_device.build_output_stream(
         &output_config.into(),
         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
@@ -392,13 +420,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Read ambient noise level (0.0 to ~1.0)
                 let mic_rms = (ambient_level.load(Ordering::Relaxed) as f32) / 10000.0;
 
+                // Scene cycling for Mixed mode
+                if matches!(mode, AsmrMode::Mixed) {
+                    mixed_scene_counter += 1;
+                    if mixed_scene_counter >= mixed_scene_duration {
+                        mixed_scene_counter = 0;
+                        mixed_scene = (mixed_scene + 1) % 3;
+                    }
+                }
+
+                // Scene weight: 1.0 if active, 0.15 bleed for smooth crossfade
+                let scene_weight = |target: usize| -> f32 {
+                    if matches!(mode, AsmrMode::Mixed) {
+                        if mixed_scene == target { 1.0 } else { 0.15 }
+                    } else {
+                        1.0
+                    }
+                };
+
                 // --- Organic Trigger Timing ---
                 if sample_counter >= next_trigger_time {
                     sample_counter = 0;
                     // Randomize next trigger time (100ms to 500ms) to prevent habituation
                     next_trigger_time = (out_sr * (0.1 + rng.f32() * 0.4)) as usize;
 
-                    // Slow scene evolution
+                    // Slow scene evolution (kept for drone/brush params)
                     scene_counter += 1;
                     if scene_counter >= 20 {
                         scene_counter = 0;
@@ -407,32 +453,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         brush.speed = 2.0 + rng.f32() * 4.0;
                     }
 
-                    // --- Adaptive Probability Math ---
-                    // Trigger probability scales inversely with room noise.
-                    // Quiet room = More tingles. Loud room = Less tingles, more masking.
-                    let t_prob = match mode {
-                        AsmrMode::Tingles | AsmrMode::Mixed => {
-                            (0.5 - mic_rms * reactivity * 1.0).max(0.0)
-                        }
-                        _ => 0.0,
+                    // --- Adaptive Probability Math (Scene-Aware) ---
+                    let t_prob = if scene_weight(2) > 0.1 {
+                        (0.5 - mic_rms * reactivity * 1.0).max(0.0) * scene_weight(2)
+                    } else {
+                        0.0
                     };
 
-                    let c_prob = match mode {
-                        AsmrMode::Mixed => (0.3 - mic_rms * reactivity * 0.8).max(0.0),
-                        _ => 0.0,
+                    let c_prob = if scene_weight(1) > 0.1 {
+                        (0.3 - mic_rms * reactivity * 0.8).max(0.0) * scene_weight(1)
+                    } else {
+                        0.0
                     };
 
-                    let ch_prob = match mode {
-                        AsmrMode::Tingles | AsmrMode::Mixed => {
-                            (0.25 - mic_rms * reactivity * 0.5).max(0.0)
-                        }
-                        _ => 0.0,
+                    let ch_prob = if scene_weight(2) > 0.1 {
+                        (0.25 - mic_rms * reactivity * 0.5).max(0.0) * scene_weight(2)
+                    } else {
+                        0.0
                     };
 
-                    let hb_prob = match mode {
-                        AsmrMode::Rain | AsmrMode::Mixed => 0.04,
-                        _ => 0.0,
-                    };
+                    let hb_prob = if scene_weight(0) > 0.1 { 0.04 } else { 0.0 };
 
                     if rng.f32() < t_prob {
                         tap.trigger_tap(&mut rng);
@@ -446,7 +486,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     if rng.f32() < ch_prob {
                         let freq = chime_scale[(rng.next() as usize) % chime_scale.len()];
-                        let decay = (-1.0 / (out_sr * (1.0 + rng.f32() * 3.0))).exp(); // 1-4s decay
+                        let decay = (-1.0 / (out_sr * (1.0 + rng.f32() * 3.0))).exp();
                         chime.trigger(freq, 0.15 + rng.f32() * 0.1, decay);
                     }
                 }
@@ -456,12 +496,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let br = noise.brown();
                 let pk = noise.pink();
 
-                // Dynamic Masking: Rain/Noise floor scales with room volume
+                // Dynamic Masking: Scales with current Mixed scene focus
                 let mask_target = match mode {
                     AsmrMode::Rain => 0.25 + mic_rms * reactivity * 2.5,
                     AsmrMode::Brush => 0.15 + mic_rms * reactivity * 1.5,
                     AsmrMode::Tingles => 0.05 + mic_rms * reactivity * 0.5,
-                    AsmrMode::Mixed => 0.15 + mic_rms * reactivity * 1.5,
+                    AsmrMode::Mixed => match mixed_scene {
+                        0 => 0.25 + mic_rms * reactivity * 2.5, // Rain focus
+                        1 => 0.15 + mic_rms * reactivity * 1.5, // Brush focus
+                        _ => 0.05 + mic_rms * reactivity * 0.5, // Tingles focus
+                    },
                 };
 
                 let smooth_coeff = 1.0 / (out_sr * 2.0); // 2 seconds smoothing
@@ -482,8 +526,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 out_l += pk * whisper_amp * 0.8;
                 out_r += pk * whisper_amp * 0.6; // Slight off-center
 
-                // Brushing (Filtered noise with modulated cutoff)
-                if matches!(mode, AsmrMode::Brush | AsmrMode::Mixed) {
+                // Brushing only active during Brush scene in Mixed mode
+                if matches!(mode, AsmrMode::Brush)
+                    || (matches!(mode, AsmrMode::Mixed) && mixed_scene == 1)
+                {
                     let brush_out = brush.play(out_sr, pk);
                     let brush_gain = 0.25 + mic_rms * reactivity * 0.5;
                     out_l += brush_out * brush_gain * 0.7;
