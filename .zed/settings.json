@@ -1,0 +1,7 @@
+{
+  "languages": {
+      "Rust": {
+          "language_servers": ["!rust-analyzer"]
+      }
+  }
+}
