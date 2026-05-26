@@ -89,17 +89,9 @@ fn smoothstep(value: f32) -> f32 {
 
 fn advance_phase(phase: &mut f32, hz: f32, sample_rate: f32) -> f32 {
     *phase += hz.max(0.0) / sample_rate.max(1.0);
-    *phase %= 1.0; // Clean, standard wrapping that eliminates rounding stutter
+    *phase %= 1.0;
     *phase
 }
-
-// fn advance_phase(phase: &mut f32, hz: f32, sample_rate: f32) -> f32 {
-//     *phase += hz.max(0.0) / sample_rate.max(1.0);
-//     if *phase >= 1.0 {
-//         *phase -= phase.floor();
-//     }
-//     *phase
-// }
 
 struct AmbientState {
     fast_rms: AtomicU32,
@@ -493,6 +485,20 @@ impl Binaural {
     }
 }
 
+/// C¹-continuous soft clip. Maps ±1.0 input to ±1.0 output with a smooth
+/// cubic knee; hard-clips anything beyond ±1.0.
+#[inline(always)]
+fn cubic_clip(x: f32) -> f32 {
+    if x <= -1.0 {
+        -1.0
+    } else if x >= 1.0 {
+        1.0
+    } else {
+        let x2 = x * x;
+        (x - x * x2 / 3.0) * 1.5
+    }
+}
+
 #[derive(Clone)]
 struct EngineConfig {
     mode: AsmrMode,
@@ -562,9 +568,11 @@ impl AsmrEngine {
             ambient: config.ambient,
             rng: FastRng::new(42),
             noise: NoiseGen::new(777),
-            tap: Trigger::new(101),
-            crinkle: Trigger::new(202),
-            heartbeat: Trigger::new(303),
+            // Seeds are spaced far apart in the XorShift32 output stream so
+            // the three trigger oscillators are decorrelated from startup.
+            tap: Trigger::new(0x0000_04D2), // 1234
+            crinkle: Trigger::new(0x1234_5678),
+            heartbeat: Trigger::new(0xDEAD_C0DE),
             chime: Chime::new(),
             brush: BrushComponent::new(),
             drone: Binaural::new(config.binaural_freq),
@@ -602,9 +610,8 @@ impl AsmrEngine {
         let pk_l = self.noise.pink();
         let pk_r = self.noise.pink();
 
-        // Scale down the target gain to keep the mix safely under digital ceiling (1.0)
         let mask_target = (0.015
-            + rain_weight * 0.08  // Reduced from 0.19
+            + rain_weight * 0.08
             + brush_weight * 0.03
             + tingle_weight * 0.01
             + self.reactivity * (env.slow * 0.08 + env.fast * 0.06))
@@ -620,7 +627,7 @@ impl AsmrEngine {
         let mut out_l = 0.0f32;
         let mut out_r = 0.0f32;
 
-        // Apply stereo-separated rain noise
+        // Stereo-separated rain/noise bed
         out_l += (br_l * 0.75 + pk_l * 0.25) * self.mask_gain;
         out_r += (br_r * 0.75 + pk_r * 0.25) * self.mask_gain;
 
@@ -651,12 +658,14 @@ impl AsmrEngine {
 
         let delicate_gain = (0.35 + env.quiet * 0.65) * env.duck;
 
-        // Triggers
-        out_l += self.tap.play(self.sample_rate) * delicate_gain * 0.62;
-        out_r += self.tap.play(self.sample_rate) * delicate_gain * 0.38;
+        // Triggers — play() is called once per frame; output is panned, not replayed.
+        let tap_out = self.tap.play(self.sample_rate) * delicate_gain;
+        out_l += tap_out * 0.62;
+        out_r += tap_out * 0.38;
 
-        out_l += self.crinkle.play(self.sample_rate) * delicate_gain * 0.48;
-        out_r += self.crinkle.play(self.sample_rate) * delicate_gain * 0.54;
+        let crinkle_out = self.crinkle.play(self.sample_rate) * delicate_gain;
+        out_l += crinkle_out * 0.48;
+        out_r += crinkle_out * 0.54;
 
         let hb_out = self.heartbeat.play(self.sample_rate) * (0.15 + rain_weight * 0.45);
         out_l += hb_out * 0.50;
@@ -666,7 +675,7 @@ impl AsmrEngine {
         out_l += chime_out * 0.40;
         out_r += chime_out * 0.60;
 
-        // Binaural Drone
+        // Binaural drone
         self.drone.target_amp = self.drone_base_amp * (0.15 + tingle_weight * 0.45) * env.duck;
         let (drone_l, drone_r) = self.drone.play(self.sample_rate);
         let drone_lfo =
@@ -677,103 +686,11 @@ impl AsmrEngine {
         out_l += drone_l * drone_mod;
         out_r += drone_r * drone_mod;
 
-        // Final soft-clip clamp
         (
-            (finite_or(out_l, 0.0) * self.volume).tanh(),
-            (finite_or(out_r, 0.0) * self.volume).tanh(),
+            cubic_clip(finite_or(out_l, 0.0) * self.volume),
+            cubic_clip(finite_or(out_r, 0.0) * self.volume),
         )
     }
-
-    // fn next_frame(&mut self) -> (f32, f32) {
-    //     let weights = self.scene_weights();
-    //     let [rain_weight, brush_weight, tingle_weight] = weights;
-    //     let env = self.reactive_state();
-    //     self.tick_schedulers(&env, weights);
-    //     self.advance_mixed_scene();
-
-    //     let br = self.noise.brown().tanh() * 2.0;
-    //     let pk = self.noise.pink().tanh() * 1.5;
-
-    //     let mask_target = (0.025
-    //         + rain_weight * 0.19
-    //         + brush_weight * 0.06
-    //         + tingle_weight * 0.025
-    //         + self.reactivity * (env.slow * 0.24 + env.fast * 0.18 + env.motion * 0.10))
-    //         .clamp(0.025, 0.70);
-    //     let mask_tau = if mask_target > self.mask_gain {
-    //         0.35
-    //     } else {
-    //         2.00
-    //     };
-    //     self.mask_gain = follow_sample(self.mask_gain, mask_target, self.sample_rate, mask_tau);
-
-    //     let mut out_l = 0.0f32;
-    //     let mut out_r = 0.0f32;
-
-    //     let rain_out = (br * 0.82 + pk * 0.18) * self.mask_gain;
-    //     out_l += rain_out;
-    //     out_r += rain_out;
-
-    //     let breathe_rate = 0.12 + env.quiet * 0.05;
-    //     let breathe =
-    //         (advance_phase(&mut self.breathe_phase, breathe_rate, self.sample_rate) * TAU).sin()
-    //             * 0.5
-    //             + 0.5;
-    //     let breathe_curve = breathe * breathe;
-    //     let whisper_amp = (0.025 + tingle_weight * 0.065 + brush_weight * 0.04)
-    //         * breathe_curve
-    //         * (0.25 + env.quiet * 0.75)
-    //         * env.duck;
-    //     out_l += pk * whisper_amp * 0.80;
-    //     out_r += pk * whisper_amp * 0.62;
-
-    //     if brush_weight > 0.01 {
-    //         let speed_target =
-    //             self.brush_base_speed + self.reactivity * (env.activity * 5.0 + env.motion * 2.0);
-    //         self.brush.set_target_speed(speed_target);
-
-    //         let brush_out = self.brush.play(self.sample_rate, pk);
-    //         let brush_gain = (0.06 + brush_weight * 0.22 + self.reactivity * env.slow * 0.16)
-    //             * (0.65 + env.duck * 0.35);
-    //         out_l += brush_out * brush_gain * 0.72;
-    //         out_r += brush_out * brush_gain * 0.52;
-    //     }
-
-    //     let delicate_gain = (0.35 + env.quiet * 0.65) * env.duck;
-
-    //     let tap_out = self.tap.play(self.sample_rate) * delicate_gain;
-    //     out_l += tap_out * 0.62;
-    //     out_r += tap_out * 0.38;
-
-    //     let crinkle_out = self.crinkle.play(self.sample_rate) * delicate_gain;
-    //     out_l += crinkle_out * 0.48;
-    //     out_r += crinkle_out * 0.54;
-
-    //     let hb_out = self.heartbeat.play(self.sample_rate) * (0.20 + rain_weight * 0.80);
-    //     out_l += hb_out * 0.45;
-    //     out_r += hb_out * 0.45;
-
-    //     let chime_out = self.chime.play(self.sample_rate) * delicate_gain * (0.35 + tingle_weight);
-    //     out_l += chime_out * 0.30;
-    //     out_r += chime_out * 0.72;
-
-    //     self.drone.target_amp = self.drone_base_amp
-    //         * (0.20 + rain_weight * 0.20 + tingle_weight * 0.70)
-    //         * (0.40 + env.quiet * 0.60)
-    //         * env.duck;
-    //     let (drone_l, drone_r) = self.drone.play(self.sample_rate);
-    //     let drone_lfo =
-    //         (advance_phase(&mut self.drone_lfo_phase, 0.045, self.sample_rate) * TAU).sin() * 0.5
-    //             + 0.5;
-    //     let drone_mod = 0.35 + drone_lfo * 0.65;
-    //     out_l += drone_l * drone_mod;
-    //     out_r += drone_r * drone_mod;
-
-    //     (
-    //         (finite_or(out_l, 0.0) * self.volume).tanh(),
-    //         (finite_or(out_r, 0.0) * self.volume).tanh(),
-    //     )
-    // }
 
     fn reactive_state(&mut self) -> ReactiveState {
         let fast_target = clamp01(load_f32(&self.ambient.fast_rms) * 8.0);
@@ -870,7 +787,13 @@ impl AsmrEngine {
         if self.mixed_pos >= self.mixed_scene_samples {
             self.mixed_pos = 0;
             self.mixed_scene = self.mixed_next_scene;
-            self.mixed_next_scene = (self.mixed_next_scene + 1) % 3;
+            // Pick the next scene randomly, avoiding an immediate repeat.
+            let candidate = (self.rng.next() as usize) % 2;
+            self.mixed_next_scene = if candidate < self.mixed_scene {
+                candidate
+            } else {
+                candidate + 1
+            };
         }
     }
 
@@ -1095,7 +1018,7 @@ where
         } else {
             frame[0] = T::from_sample(out_l);
             frame[1] = T::from_sample(out_r);
-            // Surround protection: write zero out to supplementary multi-channels
+            // Surround protection: write zero to supplementary channels
             // instead of a bleeding downmix, maintaining clean binaural parsing.
             for sample in frame.iter_mut().skip(2) {
                 *sample = T::from_sample(0.0f32);
@@ -1114,7 +1037,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     let host = cpal::default_host();
     let ambient = Arc::new(AmbientState::new());
 
-    // Setup communication channel for processing errors across runtime bounds safely
     let (err_tx, err_rx) = mpsc::channel();
 
     let _input_stream = if reactivity > 0.0 {
